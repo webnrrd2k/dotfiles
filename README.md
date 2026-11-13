@@ -37,7 +37,7 @@ of the repo.
 | `note` | Tiny command-line note taker |
 | `google2org` | Convert text copied from Google results into org-mode |
 | `mdfm` | Markdown helper |
-| `zip` | Clean text into a filesystem-friendly folder name (note: shadows `/usr/bin/zip`) |
+| `dirname-clean` | Clean text into a filesystem-friendly folder name |
 | `rotate`, `pre.py`, `post.py`, `before.py`, `sandr.py` | Small text and filename utilities |
 
 The Nautilus folder stack (`fstack`, `npush`, …) lives in its own repo:
