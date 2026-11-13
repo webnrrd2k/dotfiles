@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+
+import sys
+
+def main():
+    args = sys.argv[1:]
+
+    # Check if data is being piped in (stdin is not a tty)
+    if not sys.stdin.isatty():
+        # Read from standard input, split by whitespace, and append to args
+        piped_input = sys.stdin.read().split()
+        args.extend(piped_input)
+
+    # Handle the edge case where no arguments are passed or piped
+    if not args:
+        print("Please provide at least one argument.")
+        return
+
+    # Take the last argument, then extend with the remaining arguments
+    reordered_args = [args[-1]] + args[:-1]
+
+    # Print all arguments separated by a space
+    print(*reordered_args)
+
+if __name__ == "__main__":
+    main()
+
+
+
+##!/usr/bin/env python3
+#
+#import sys
+#
+#def main():
+#    # sys.argv[0] is the script name itself, so arguments start at index 1
+#    args = sys.argv[1:]
+#
+#    # Handle the edge case where no arguments are passed
+#    if not args:
+#        print("Please provide at least one argument.")
+#        return
+#
+#    # Take the last argument, then extend with the remaining arguments
+#    reordered_args = [args[-1]] + args[:-1]
+#
+#    # Print all arguments separated by a space
+#    print(*reordered_args)
+#
+#if __name__ == "__main__":
+#    main()

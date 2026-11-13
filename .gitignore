@@ -1,0 +1,5 @@
+# Machine-local or secret shell config: keep these out of git.
+*.local.bash
+*secret*
+*.env
+*.kate-swp

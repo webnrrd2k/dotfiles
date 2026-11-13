@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""google2org.py — convert text copied from Google search results
+(AI Overviews, featured snippets, "People also ask" answers, etc.)
+into org-mode format.
+
+Copied search text is messy: bullets arrive as "•", "●", "◦", "-",
+or vanish entirely; headings become bare lines ending in ":"; bold
+terms flatten to "Term: description". This script reconstructs a
+sensible org outline from those patterns.
+
+Usage:
+    google2org.py [INPUT] [-o OUTPUT] [--title TITLE] [--level N]
+
+    INPUT            input text file; omit (or use "-") to read stdin
+    -o, --output     write to file instead of stdout
+    --title TITLE    wrap everything under a top-level "* TITLE" heading
+    --level N        org level for detected headings (default 1;
+                     bumped by one automatically when --title is used)
+
+Examples:
+    # paste, then Ctrl-D
+    google2org.py --title "Fourteen unanswerable questions"
+
+    # straight from the clipboard (Linux / macOS)
+    xclip -o  | google2org.py --title "Avyakata" >> buddhism.org
+    pbpaste   | google2org.py -o snippet.org
+"""
+
+import argparse
+import re
+import sys
+
+# Bullet characters Google (and most sites) emit when text is copied.
+BULLET_CHARS = "•●◦▪‣∙·–—-*"
+BULLET_RE = re.compile(rf"^(\s*)([{re.escape(BULLET_CHARS)}])\s+(.*)$")
+NUMBERED_RE = re.compile(r"^(\s*)(\d{1,3})[.)]\s+(.*)$")
+# "Term: description" — bold the term. Term kept short so ordinary
+# sentences containing a colon aren't mangled.
+TERM_RE = re.compile(r"^([^:]{2,60}?):\s+(\S.*)$")
+# Lines Google injects that are noise in notes.
+NOISE_RE = re.compile(
+    r"^(AI Overview|Show more|Show less|Learn more|Generative AI is experimental.*"
+    r"|AI responses may include mistakes.*|People also ask|Search Labs.*|Feedback"
+    r"|About [\d,]+ results.*|\d+ sites?)$",
+    re.IGNORECASE,
+)
+URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$")
+
+
+def is_heading(line: str, next_line: str | None) -> bool:
+    """Guess whether a bare line acts as a section heading.
+
+    Heuristics: short, not a full sentence, and either ends with a colon
+    or is immediately followed by list-like content.
+    """
+    text = line.strip()
+    if not text or len(text) > 70:
+        return False
+    if BULLET_RE.match(line) or NUMBERED_RE.match(line):
+        return False
+    if text.endswith(":"):
+        return True
+    # A short line with no sentence-ending punctuation, followed by a
+    # bullet or numbered item, is almost certainly a heading.
+    if next_line is not None and not text.endswith((".", "!", "?", ",", ";")):
+        if BULLET_RE.match(next_line) or NUMBERED_RE.match(next_line):
+            return True
+    return False
+
+
+def bold_term(text: str) -> str:
+    """Turn 'Term: description' into '*Term*: description'."""
+    m = TERM_RE.match(text)
+    if m and not m.group(1).strip().startswith("*"):
+        return f"*{m.group(1).strip()}*: {m.group(2)}"
+    return text
+
+
+def indent_depth(ws: str) -> int:
+    """Map leading whitespace to a nesting depth (2 spaces or 1 tab per level)."""
+    return ws.count("\t") + len(ws.replace("\t", "")) // 2
+
+
+def convert(text: str, heading_level: int = 1, title: str | None = None) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+
+    if title:
+        out.append("*" * heading_level + f" {title}")
+        heading_level += 1
+
+    prev_blank = True  # suppress leading blanks
+    for i, raw in enumerate(lines):
+        line = raw.rstrip()
+        nxt = next((l for l in lines[i + 1:] if l.strip()), None)
+
+        # Drop noise and bare source URLs.
+        if not line.strip():
+            if not prev_blank:
+                out.append("")
+            prev_blank = True
+            continue
+        if NOISE_RE.match(line.strip()) or URL_ONLY_RE.match(line):
+            continue
+
+        m = BULLET_RE.match(line)
+        if m:
+            depth = indent_depth(m.group(1))
+            out.append("  " * depth + "- " + bold_term(m.group(3).strip()))
+            prev_blank = False
+            continue
+
+        m = NUMBERED_RE.match(line)
+        if m:
+            depth = indent_depth(m.group(1))
+            out.append("  " * depth + f"{m.group(2)}. " + bold_term(m.group(3).strip()))
+            prev_blank = False
+            continue
+
+        if is_heading(line, nxt):
+            if out and out[-1] != "":
+                out.append("")
+            out.append("*" * heading_level + " " + line.strip().rstrip(":"))
+            prev_blank = False
+            continue
+
+        # Plain paragraph text.
+        out.append(line.strip())
+        prev_blank = False
+
+    # Trim trailing blanks and end with a newline.
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out) + "\n"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Convert copied Google search text to org-mode."
+    )
+    p.add_argument("input", nargs="?", default="-",
+                   help="input file, or '-' / omitted for stdin")
+    p.add_argument("-o", "--output", help="output file (default: stdout)")
+    p.add_argument("--title", help="wrap output under a top-level heading")
+    p.add_argument("--level", type=int, default=1,
+                   help="org level for detected headings (default 1)")
+    args = p.parse_args()
+
+    if args.input == "-":
+        text = sys.stdin.read()
+    else:
+        with open(args.input, encoding="utf-8") as f:
+            text = f.read()
+
+    result = convert(text, heading_level=args.level, title=args.title)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(result)
+    else:
+        sys.stdout.write(result)
+
+
+if __name__ == "__main__":
+    main()

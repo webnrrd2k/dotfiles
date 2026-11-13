@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""
+note — a tiny command-line note taker.
+
+Usage:
+    note "some text"                 Append text to the default file (notes.txt)
+    note quotes "a famous quote"     Append text to notes-quotes.txt
+    echo "some text" | note          Pipe text into the default file
+    echo "a quote" | note quotes -   Pipe text into notes-quotes.txt ("-" = stdin)
+    note -m [category]               Type/paste a multi-line note, end with \"\"\"
+    note -e [category]               Compose a note in your $EDITOR
+    note --show [category]           Print a note file
+    note --grep TEXT [category]      Show notes containing TEXT (any case)
+    note --grep -E REGEX [category]  Show notes matching a regular expression
+    note --list                      List existing note files
+    note --test                      Run the built-in unit tests
+    note -- "-5 degrees today"       Everything after -- is literal note text
+
+Where notes live:
+    ~/Documents/notes/ by default, created on first use. Set the NOTES_DIR
+    environment variable to use a different directory.
+
+Each note is stamped with the date and time it was saved, and notes in a
+file are divided by a line of "==========".
+
+Multi-line mode (-m / --multiline) reads your note directly, so the shell
+never touches it: quotes, $variables, backticks, backslashes, ! and blank
+lines are all saved exactly as typed or pasted. Finish the note with a line
+containing only  \"\"\"  (three double quotes), or press Ctrl-D. Ctrl-C cancels.
+
+    $ note -m test
+    Enter your note. Finish with a line containing only \"\"\" (or press Ctrl-D).
+    She said "it's $5" & left `now`!
+        indented line
+    \"\"\"
+    Saved to /home/you/Documents/notes/notes-test.txt
+
+Editor mode (-e / --edit) opens a temporary file in $VISUAL or $EDITOR
+(falling back to nano). Whatever you save there is appended as one note.
+Save an empty file to cancel.
+
+Reading from stdin:
+    Piped text is read only when you give no arguments at all, or when the
+    last argument is "-". A single argument is always the note text, so
+    `note "$line"` inside a `while read` loop never swallows the loop's input.
+
+Category safety check:
+    If you type `note word` at a terminal and "word" is the name of an
+    existing category, note refuses instead of saving the single word —
+    you probably meant `note -m word`. Use `note -- word` to save it anyway.
+
+Search (--grep):
+    Plain-text, case-insensitive search by default, so "C++" or "$5" just
+    work. Add -E to use a (case-insensitive) regular expression instead.
+    Whole notes are shown, and the timestamp is searchable too
+    (try: note --grep 2026-10).
+    Exit status is 1 when nothing matches, like grep.
+"""
+
+import contextlib
+import io
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Iterable, TextIO
+from unittest import mock
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Default directory where all note files live (overridable via $NOTES_DIR).
+DEFAULT_NOTES_DIR = Path.home() / "Documents" / "notes"
+NOTES_DIR_ENV = "NOTES_DIR"
+
+# Name of the default (uncategorized) notes file.
+DEFAULT_FILENAME = "notes.txt"
+
+# Line written between notes so you can see where one ends and the next begins.
+SEPARATOR = "=========="
+
+# A line containing only this ends a note in multi-line (-m) mode.
+TERMINATOR = '"""'
+
+# Header line written above each note.
+TIMESTAMP_FORMAT = "[%Y-%m-%d %H:%M]"
+
+# Positional argument meaning "read the note text from stdin".
+STDIN_MARKER = "-"
+
+
+class UsageError(ValueError):
+    """The command line itself is wrong (exit status 2)."""
+
+
+# ---------------------------------------------------------------------------
+# Core logic (kept free of side effects where possible so it is easy to test)
+# ---------------------------------------------------------------------------
+
+def get_notes_dir() -> Path:
+    """Return the notes directory: $NOTES_DIR if set, else the default."""
+    override = os.environ.get(NOTES_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_NOTES_DIR
+
+
+def sanitize_category(category: str) -> str:
+    """
+    Turn a user-supplied category into a safe filename fragment.
+
+    Lowercases the input, replaces whitespace with underscores, and strips
+    out anything that isn't a letter, digit, underscore, or hyphen. Raises
+    ValueError if nothing usable remains (e.g. category was "///").
+    """
+    cleaned = category.strip().lower()
+    cleaned = re.sub(r"\s+", "_", cleaned)          # spaces -> underscores
+    cleaned = re.sub(r"[^a-z0-9_\-]", "", cleaned)  # drop unsafe characters
+    if not cleaned:
+        raise ValueError(f"Category {category!r} contains no usable characters.")
+    return cleaned
+
+
+def filename_for(category: str | None) -> str:
+    """
+    Return the note filename for a given category.
+
+    None (no category) -> "notes.txt"
+    "quotes"           -> "notes-quotes.txt"
+    """
+    if category is None:
+        return DEFAULT_FILENAME
+    return f"notes-{sanitize_category(category)}.txt"
+
+
+def append_note(text: str, category: str | None = None,
+                notes_dir: Path | None = None,
+                timestamp: datetime | None = None) -> Path:
+    """
+    Append `text` (plus a trailing newline) to the appropriate note file.
+
+    If `timestamp` is given, a "[YYYY-MM-DD HH:MM]" line is written above
+    the note. Creates the notes directory if needed. Returns the path of
+    the file that was written, so the caller can report it to the user.
+    """
+    if not text.strip():
+        raise ValueError("Refusing to save an empty note.")
+    if notes_dir is None:
+        notes_dir = get_notes_dir()
+
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    target = notes_dir / filename_for(category)
+
+    # The very first note in a file gets no separator above it.
+    needs_separator = target.exists() and target.stat().st_size > 0
+
+    with target.open("a", encoding="utf-8") as f:
+        if needs_separator:
+            f.write(SEPARATOR + "\n")
+        if timestamp is not None:
+            f.write(timestamp.strftime(TIMESTAMP_FORMAT) + "\n")
+        f.write(text.rstrip("\n") + "\n")
+
+    return target
+
+
+def parse_positionals(args: list[str],
+                      allow_stdin_marker: bool = True
+                      ) -> tuple[str | None, str | None]:
+    """
+    Turn positional arguments into (category, text).
+
+    text is None when the note should be read from stdin, which happens
+    only for no arguments at all, or when the last argument is "-":
+
+        []                 -> (None, None)        read stdin
+        ["-"]              -> (None, None)        read stdin
+        ["quotes", "-"]    -> ("quotes", None)    read stdin
+        ["hello"]          -> (None, "hello")
+        ["quotes", "hi"]   -> ("quotes", "hi")
+
+    allow_stdin_marker=False makes "-" ordinary text (used after "--").
+    """
+    if len(args) > 2:
+        raise UsageError(
+            'Too many arguments. Usage: note "text"  or  note <category> "text"'
+            "\n  (Quote the note text so the shell passes it as one argument.)"
+        )
+    if allow_stdin_marker and args and args[-1] == STDIN_MARKER:
+        return (args[0] if len(args) == 2 else None), None
+    if not args:
+        return None, None
+    if len(args) == 1:
+        return None, args[0]
+    return args[0], args[1]
+
+
+def looks_like_category(text: str, notes_dir: Path) -> bool:
+    """
+    True when `text` is a single word that names an existing category file
+    — a sign the user typed `note quotes` meaning the category, not a note.
+    """
+    if len(text.split()) != 1:
+        return False
+    try:
+        name = filename_for(text.strip())
+    except ValueError:
+        return False
+    return (notes_dir / name).is_file()
+
+
+def read_until_terminator(lines: Iterable[str],
+                          terminator: str = TERMINATOR) -> str:
+    """
+    Collect lines until one consists solely of `terminator` (surrounding
+    whitespace ignored), or until the input ends (Ctrl-D / EOF).
+
+    Everything before the terminator is returned verbatim. The terminator
+    line itself, and anything after it, is discarded.
+    """
+    collected = []
+    for line in lines:
+        if line.strip() == terminator:
+            break
+        collected.append(line)
+    return "".join(collected)
+
+
+def compose_in_editor(editor: str | None = None) -> str:
+    """
+    Open a temporary file in the user's editor and return what they wrote.
+
+    The editor is chosen from, in order: the `editor` argument (used by the
+    tests to inject a fake editor), $VISUAL, $EDITOR, then "nano". The value
+    is split like a shell command line, so "code --wait" works, but it is
+    run directly rather than through a shell. An empty/whitespace-only
+    result means the user cancelled.
+    """
+    editor = editor or os.environ.get("VISUAL") or os.environ.get("EDITOR") \
+        or "nano"
+    try:
+        command = shlex.split(editor)
+    except ValueError as exc:
+        raise ValueError(f"Can't parse editor command {editor!r}: {exc}")
+    if not command:
+        raise ValueError("The editor command is empty; set $VISUAL or $EDITOR.")
+
+    # delete=False so the editor can reopen it by name; we remove it ourselves.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".note.txt", delete=False, encoding="utf-8"
+    ) as tf:
+        tmp_path = Path(tf.name)
+
+    try:
+        try:
+            result = subprocess.call(command + [str(tmp_path)])
+        except FileNotFoundError:
+            raise ValueError(
+                f"Editor {command[0]!r} not found; set $VISUAL or $EDITOR.")
+        if result != 0:
+            raise ValueError(f"Editor exited with status {result}; not saving.")
+        return tmp_path.read_text(encoding="utf-8")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def list_note_files(notes_dir: Path | None = None) -> list[Path]:
+    """Return a sorted list of note files currently in the notes directory."""
+    if notes_dir is None:
+        notes_dir = get_notes_dir()
+    if not notes_dir.is_dir():
+        return []
+    return sorted(p for p in notes_dir.glob("*.txt") if p.is_file())
+
+
+def read_note_file(category: str | None, notes_dir: Path | None = None) -> str:
+    """Return the full contents of a category's note file."""
+    if notes_dir is None:
+        notes_dir = get_notes_dir()
+    path = notes_dir / filename_for(category)
+    if not path.is_file():
+        raise ValueError(f"No note file {path.name} in {notes_dir}")
+    return path.read_text(encoding="utf-8")
+
+
+def split_notes(content: str) -> list[str]:
+    """Split a note file's contents into individual notes at separator lines."""
+    notes, current = [], []
+    for line in content.splitlines(keepends=True):
+        if line.rstrip("\r\n") == SEPARATOR:
+            notes.append("".join(current))
+            current = []
+        else:
+            current.append(line)
+    notes.append("".join(current))
+    return [n for n in notes if n.strip()]
+
+
+def search_notes(pattern: str, category: str | None = None,
+                 notes_dir: Path | None = None, use_regex: bool = False
+                 ) -> list[tuple[Path, list[str]]]:
+    """
+    Find notes containing `pattern`, case-insensitively. It is plain text
+    unless use_regex=True. Searches one category's file if given, otherwise
+    every note file. Returns [(file, [matching notes]), ...].
+    """
+    if notes_dir is None:
+        notes_dir = get_notes_dir()
+    if not pattern:
+        raise UsageError("The search text is empty.")
+    if use_regex:
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"Invalid regular expression {pattern!r}: {exc}")
+    else:
+        regex = re.compile(re.escape(pattern), re.IGNORECASE)
+
+    if category is not None:
+        path = notes_dir / filename_for(category)
+        if not path.is_file():
+            raise ValueError(f"No note file {path.name} in {notes_dir}")
+        files = [path]
+    else:
+        files = list_note_files(notes_dir)
+
+    results = []
+    for path in files:
+        notes = split_notes(path.read_text(encoding="utf-8"))
+        matches = [n for n in notes if regex.search(n)]
+        if matches:
+            results.append((path, matches))
+    return results
+
+
+def format_search_results(results: list[tuple[Path, list[str]]]) -> str:
+    """Render search results grouped by file, notes divided by separators."""
+    blocks = []
+    for path, notes in results:
+        body = (SEPARATOR + "\n").join(
+            n if n.endswith("\n") else n + "\n" for n in notes)
+        blocks.append(f"==> {path.name} <==\n{body}")
+    return "\n".join(blocks)
+
+
+def run_tests(suite: unittest.TestSuite | None = None,
+              stream: TextIO | None = None) -> int:
+    """Run the unit tests; return 0 if they all pass, 1 otherwise."""
+    if suite is None:
+        suite = unittest.defaultTestLoader.loadTestsFromModule(
+            sys.modules[__name__])
+    runner = unittest.TextTestRunner(stream=stream or sys.stderr, verbosity=2)
+    return 0 if runner.run(suite).wasSuccessful() else 1
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface
+# ---------------------------------------------------------------------------
+
+def split_argv(argv: list[str]) -> tuple[list[str], list[str], bool]:
+    """Split at the first "--": (before, after, whether "--" was present)."""
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:], True
+    return list(argv), [], False
+
+
+def _optional_category(option: str, rest: list[str]) -> str | None:
+    """For -m / -e: at most one argument, the category (validated now)."""
+    if len(rest) > 1:
+        raise UsageError(f"{option} takes at most one argument (the category).")
+    category = rest[0] if rest else None
+    filename_for(category)  # fail before the user types a long note
+    return category
+
+
+def _save(text: str, category: str | None, notes_dir: Path,
+          now: Callable[[], datetime]) -> int:
+    target = append_note(text, category=category, notes_dir=notes_dir,
+                         timestamp=now())
+    print(f"Saved to {target}")
+    return 0
+
+
+def _run_option(option: str, rest: list[str], stdin: TextIO,
+                notes_dir: Path, now: Callable[[], datetime]) -> int:
+    if option in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    if option == "--test":
+        return run_tests()
+
+    if option == "--list":
+        files = list_note_files(notes_dir)
+        if not files:
+            print(f"No note files found in {notes_dir}")
+        for path in files:
+            print(path.name)
+        return 0
+
+    if option == "--show":
+        if len(rest) > 1:
+            raise UsageError("--show takes at most one argument (the category).")
+        print(read_note_file(rest[0] if rest else None, notes_dir), end="")
+        return 0
+
+    if option == "--grep":
+        use_regex = bool(rest) and rest[0] == "-E"
+        if use_regex:
+            rest = rest[1:]
+        if not 1 <= len(rest) <= 2:
+            raise UsageError("Usage: note --grep [-E] PATTERN [category]")
+        results = search_notes(rest[0], rest[1] if len(rest) == 2 else None,
+                               notes_dir, use_regex=use_regex)
+        if not results:
+            print("No matching notes.")
+            return 1
+        print(format_search_results(results), end="")
+        return 0
+
+    if option in ("-m", "--multiline"):
+        category = _optional_category(option, rest)
+        if stdin.isatty():
+            # Prompt goes to stderr so stdout stays clean for scripting.
+            print(f"Enter your note. Finish with a line containing only "
+                  f"{TERMINATOR} (or press Ctrl-D).", file=sys.stderr)
+        text = read_until_terminator(stdin)
+        if not text.strip():
+            print("Empty note — nothing saved.")
+            return 0
+        return _save(text, category, notes_dir, now)
+
+    if option in ("-e", "--edit"):
+        category = _optional_category(option, rest)
+        text = compose_in_editor()
+        if not text.strip():
+            print("Empty note — nothing saved.")
+            return 0
+        return _save(text, category, notes_dir, now)
+
+    raise UsageError(
+        f"Unknown option {option!r}.\n"
+        f'  To save a note that starts with "-", put -- first:  '
+        f'note -- "{option} ..."'
+    )
+
+
+def _run(argv: list[str], stdin: TextIO, now: Callable[[], datetime]) -> int:
+    notes_dir = get_notes_dir()
+    before, after, literal = split_argv(argv)
+
+    # Options are only recognized as the first argument, and never after --.
+    if before and before[0].startswith("-") and before[0] != STDIN_MARKER:
+        return _run_option(before[0], before[1:] + after, stdin, notes_dir, now)
+
+    args = before + after
+    # "-" means stdin only when it was typed before any "--".
+    category, text = parse_positionals(args, allow_stdin_marker=not after)
+
+    if text is None:
+        if not args and stdin.isatty():
+            print(__doc__.strip())          # bare `note`: show help
+            return 0
+        if stdin.isatty():
+            print("Type your note, then press Ctrl-D.", file=sys.stderr)
+        text = stdin.read()
+        if not text.strip():
+            if not args:
+                print(__doc__.strip())      # empty pipe, no args: show help
+                return 0
+            raise ValueError("Nothing came in on stdin — nothing saved.")
+    elif (category is None and not literal and stdin.isatty()
+          and looks_like_category(text, notes_dir)):
+        word = text.strip()
+        raise UsageError(
+            f"{word!r} is the name of an existing category, not a note.\n"
+            f"  To write a note in it:    note -m {word}\n"
+            f"  To save the word itself:  note -- {word}"
+        )
+
+    return _save(text, category, notes_dir, now)
+
+
+def main(argv: list[str], stdin: TextIO | None = None,
+         now: Callable[[], datetime] = datetime.now) -> int:
+    """
+    Parse argv (excluding the program name) and perform the requested action.
+    Returns a process exit code: 0 success, 1 error, 2 bad usage, 130 Ctrl-C.
+    `stdin` and `now` are injectable for the tests.
+    """
+    try:
+        return _run(argv, sys.stdin if stdin is None else stdin, now)
+    except UsageError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nCancelled — nothing saved.", file=sys.stderr)
+        return 130
+
+
+# ---------------------------------------------------------------------------
+# Tests (run with:  note --test)
+# ---------------------------------------------------------------------------
+
+class TempDirTestCase(unittest.TestCase):
+    """Gives each test a fresh temporary notes directory; never ~/Documents."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+
+class NoteTests(TempDirTestCase):
+    """Unit tests for the note-taking logic."""
+
+    # -- filename / category handling ------------------------------------
+
+    def test_default_filename(self):
+        self.assertEqual(filename_for(None), "notes.txt")
+
+    def test_category_filename(self):
+        self.assertEqual(filename_for("quotes"), "notes-quotes.txt")
+
+    def test_category_is_sanitized(self):
+        self.assertEqual(filename_for("Famous Quotes!"),
+                         "notes-famous_quotes.txt")
+
+    def test_unusable_category_raises(self):
+        with self.assertRaises(ValueError):
+            filename_for("///")
+
+    # -- notes directory / $NOTES_DIR -------------------------------------
+
+    def test_notes_dir_env_override(self):
+        with mock.patch.dict(os.environ, {NOTES_DIR_ENV: str(self.dir)}):
+            self.assertEqual(get_notes_dir(), self.dir)
+
+    def test_notes_dir_env_expands_tilde(self):
+        with mock.patch.dict(os.environ, {NOTES_DIR_ENV: "~/my-notes"}):
+            self.assertEqual(get_notes_dir(), Path.home() / "my-notes")
+
+    def test_notes_dir_default_when_unset_or_blank(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop(NOTES_DIR_ENV, None)
+            self.assertEqual(get_notes_dir(), DEFAULT_NOTES_DIR)
+        with mock.patch.dict(os.environ, {NOTES_DIR_ENV: "  "}):
+            self.assertEqual(get_notes_dir(), DEFAULT_NOTES_DIR)
+
+    def test_append_uses_env_dir_by_default(self):
+        with mock.patch.dict(os.environ, {NOTES_DIR_ENV: str(self.dir)}):
+            target = append_note("hi")
+        self.assertEqual(target, self.dir / "notes.txt")
+
+    # -- appending behavior ----------------------------------------------
+
+    def test_append_creates_dir_and_file(self):
+        target = append_note("hello", notes_dir=self.dir / "nested")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_text(), "hello\n")
+
+    def test_append_is_cumulative_with_separator(self):
+        append_note("first", notes_dir=self.dir)
+        append_note("second", notes_dir=self.dir)
+        content = (self.dir / "notes.txt").read_text()
+        self.assertEqual(content, f"first\n{SEPARATOR}\nsecond\n")
+
+    def test_no_separator_for_first_note(self):
+        append_note("only note", notes_dir=self.dir)
+        content = (self.dir / "notes.txt").read_text()
+        self.assertNotIn(SEPARATOR, content)
+
+    def test_append_to_category_file(self):
+        target = append_note("a quote", category="quotes", notes_dir=self.dir)
+        self.assertEqual(target.name, "notes-quotes.txt")
+        self.assertEqual(target.read_text(), "a quote\n")
+
+    def test_empty_note_rejected(self):
+        with self.assertRaises(ValueError):
+            append_note("   ", notes_dir=self.dir)
+
+    # -- timestamps --------------------------------------------------------
+
+    def test_timestamp_written_above_note(self):
+        append_note("hello", notes_dir=self.dir,
+                    timestamp=datetime(2026, 10, 14, 15, 2))
+        self.assertEqual((self.dir / "notes.txt").read_text(),
+                         "[2026-10-14 15:02]\nhello\n")
+
+    def test_timestamp_comes_after_separator(self):
+        append_note("one", notes_dir=self.dir,
+                    timestamp=datetime(2026, 10, 14, 9, 0))
+        append_note("two", notes_dir=self.dir,
+                    timestamp=datetime(2026, 10, 15, 17, 30))
+        self.assertEqual(
+            (self.dir / "notes.txt").read_text(),
+            f"[2026-10-14 09:00]\none\n{SEPARATOR}\n[2026-10-15 17:30]\ntwo\n")
+
+    # -- positional arguments ---------------------------------------------
+
+    def test_parse_text_only(self):
+        self.assertEqual(parse_positionals(["hello"]), (None, "hello"))
+
+    def test_parse_category_and_text(self):
+        self.assertEqual(parse_positionals(["quotes", "hi"]), ("quotes", "hi"))
+
+    def test_parse_no_args_means_stdin(self):
+        self.assertEqual(parse_positionals([]), (None, None))
+
+    def test_parse_dash_means_stdin(self):
+        self.assertEqual(parse_positionals(["-"]), (None, None))
+
+    def test_parse_category_dash_means_stdin(self):
+        self.assertEqual(parse_positionals(["quotes", "-"]), ("quotes", None))
+
+    def test_parse_dash_literal_when_disallowed(self):
+        self.assertEqual(parse_positionals(["-"], allow_stdin_marker=False),
+                         (None, "-"))
+
+    def test_parse_too_many(self):
+        with self.assertRaises(UsageError):
+            parse_positionals(["a", "b", "c"])
+
+    # -- category safety check -------------------------------------------
+
+    def test_looks_like_category_existing(self):
+        append_note("x", category="test", notes_dir=self.dir)
+        self.assertTrue(looks_like_category("test", self.dir))
+        self.assertTrue(looks_like_category("  Test ", self.dir))
+
+    def test_looks_like_category_rejects_others(self):
+        append_note("x", category="test", notes_dir=self.dir)
+        self.assertFalse(looks_like_category("test this", self.dir))
+        self.assertFalse(looks_like_category("other", self.dir))
+        self.assertFalse(looks_like_category("///", self.dir))
+
+    # -- multi-line (triple-quote terminated) mode --------------------------
+
+    def test_multiline_stops_at_terminator(self):
+        src = io.StringIO('line one\nline two\n"""\nignored\n')
+        self.assertEqual(read_until_terminator(src), "line one\nline two\n")
+
+    def test_multiline_preserves_special_characters(self):
+        tricky = ('She said "it\'s $5" & left `now`!\n'
+                  '\tpath: C:\\temp\\new\n'
+                  "  ''single'' and \"double\"\n")
+        src = io.StringIO(tricky + '"""\n')
+        self.assertEqual(read_until_terminator(src), tricky)
+
+    def test_multiline_keeps_blank_lines_and_indentation(self):
+        body = "first\n\n    indented\n\nlast\n"
+        self.assertEqual(read_until_terminator(io.StringIO(body + '"""\n')),
+                         body)
+
+    def test_multiline_eof_without_terminator(self):
+        src = io.StringIO("no terminator here\nsecond line")
+        self.assertEqual(read_until_terminator(src),
+                         "no terminator here\nsecond line")
+
+    def test_multiline_terminator_with_whitespace(self):
+        src = io.StringIO('text\n   """   \nafter\n')
+        self.assertEqual(read_until_terminator(src), "text\n")
+
+    def test_multiline_inline_quotes_are_not_terminator(self):
+        src = io.StringIO('def f():\n    """docstring"""\n"""\n')
+        self.assertEqual(read_until_terminator(src),
+                         'def f():\n    """docstring"""\n')
+
+    def test_multiline_immediate_terminator_is_empty(self):
+        self.assertEqual(read_until_terminator(io.StringIO('"""\n')), "")
+
+    # -- editor mode -------------------------------------------------------
+
+    def test_compose_in_editor_returns_content(self):
+        # A command with flags and quoted arguments, standing in for a real
+        # editor; the temp file path is appended as the last argument.
+        fake_editor = "sh -c 'printf \"written by editor\\n\" > \"$1\"' editor"
+        self.assertEqual(compose_in_editor(editor=fake_editor),
+                         "written by editor\n")
+
+    def test_compose_in_editor_empty_means_cancel(self):
+        self.assertEqual(compose_in_editor(editor="true").strip(), "")
+
+    def test_compose_in_editor_failure_raises(self):
+        with self.assertRaises(ValueError):
+            compose_in_editor(editor="false")
+
+    def test_compose_in_editor_missing_editor_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            compose_in_editor(editor="no-such-editor-xyz --wait")
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_compose_in_editor_bad_quoting_raises(self):
+        with self.assertRaises(ValueError):
+            compose_in_editor(editor="vim 'unclosed")
+
+    def test_compose_in_editor_no_shell_interpretation(self):
+        # Without a shell, ";" is just an argument, so nothing gets injected.
+        marker = self.dir / "injected"
+        compose_in_editor(editor=f"true ; touch {marker}")
+        self.assertFalse(marker.exists())
+
+    # -- listing / showing ------------------------------------------------
+
+    def test_list_note_files(self):
+        append_note("x", notes_dir=self.dir)
+        append_note("y", category="ideas", notes_dir=self.dir)
+        names = [p.name for p in list_note_files(self.dir)]
+        self.assertEqual(names, ["notes-ideas.txt", "notes.txt"])
+
+    def test_list_missing_dir(self):
+        self.assertEqual(list_note_files(self.dir / "does-not-exist"), [])
+
+    def test_read_note_file(self):
+        append_note("hello", category="ideas", notes_dir=self.dir)
+        self.assertEqual(read_note_file("ideas", self.dir), "hello\n")
+
+    def test_read_note_file_missing_raises(self):
+        with self.assertRaises(ValueError):
+            read_note_file("nope", self.dir)
+
+    # -- searching ---------------------------------------------------------
+
+    def test_split_notes(self):
+        content = f"a\nb\n{SEPARATOR}\nc\n{SEPARATOR}\n"
+        self.assertEqual(split_notes(content), ["a\nb\n", "c\n"])
+
+    def test_search_case_insensitive_whole_notes(self):
+        append_note("Buy MILK\nand eggs", notes_dir=self.dir)
+        append_note("call mom", notes_dir=self.dir)
+        results = search_notes("milk", notes_dir=self.dir)
+        self.assertEqual(results,
+                         [(self.dir / "notes.txt", ["Buy MILK\nand eggs\n"])])
+
+    def test_search_regex(self):
+        append_note("error 404", notes_dir=self.dir)
+        append_note("all good", notes_dir=self.dir)
+        results = search_notes(r"\d{3}", notes_dir=self.dir, use_regex=True)
+        self.assertEqual(results[0][1], ["error 404\n"])
+
+    def test_search_plain_text_by_default(self):
+        # Regex metacharacters are taken literally without -E.
+        append_note("learning C++ today", notes_dir=self.dir)
+        append_note("learning C today", notes_dir=self.dir)
+        append_note("costs $5 (maybe)", notes_dir=self.dir)
+        self.assertEqual(search_notes("C++", notes_dir=self.dir)[0][1],
+                         ["learning C++ today\n"])
+        self.assertEqual(search_notes("$5 (", notes_dir=self.dir)[0][1],
+                         ["costs $5 (maybe)\n"])
+
+    def test_search_invalid_regex_raises(self):
+        append_note("x", notes_dir=self.dir)
+        with self.assertRaises(ValueError):
+            search_notes("(unclosed", notes_dir=self.dir, use_regex=True)
+
+    def test_search_empty_pattern_raises(self):
+        with self.assertRaises(UsageError):
+            search_notes("", notes_dir=self.dir)
+
+    def test_search_across_files_and_by_category(self):
+        append_note("idea: rust tool", category="ideas", notes_dir=self.dir)
+        append_note("rust meetup", notes_dir=self.dir)
+        everywhere = search_notes("rust", notes_dir=self.dir)
+        self.assertEqual([p.name for p, _ in everywhere],
+                         ["notes-ideas.txt", "notes.txt"])
+        only_ideas = search_notes("rust", category="ideas", notes_dir=self.dir)
+        self.assertEqual([p.name for p, _ in only_ideas], ["notes-ideas.txt"])
+
+    def test_search_matches_timestamp(self):
+        append_note("old", notes_dir=self.dir, timestamp=datetime(2025, 1, 1))
+        append_note("new", notes_dir=self.dir, timestamp=datetime(2026, 10, 14))
+        results = search_notes("2026-10", notes_dir=self.dir)
+        self.assertEqual(results[0][1], ["[2026-10-14 00:00]\nnew\n"])
+
+    def test_search_missing_category_raises(self):
+        with self.assertRaises(ValueError):
+            search_notes("x", category="nope", notes_dir=self.dir)
+
+    def test_format_search_results(self):
+        out = format_search_results([(Path("notes.txt"), ["a\n", "b\n"])])
+        self.assertEqual(out, f"==> notes.txt <==\na\n{SEPARATOR}\nb\n")
+
+    # -- test runner exit status ------------------------------------------
+
+    def test_run_tests_reports_failure(self):
+        class Failing(unittest.TestCase):
+            def test_fails(self):
+                self.fail("intentional")
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Failing)
+        self.assertEqual(run_tests(suite, stream=io.StringIO()), 1)
+
+    def test_run_tests_reports_success(self):
+        class Passing(unittest.TestCase):
+            def test_passes(self):
+                pass
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Passing)
+        self.assertEqual(run_tests(suite, stream=io.StringIO()), 0)
+
+
+class FakeStdin(io.StringIO):
+    """A stdin stand-in that can pretend to be a terminal or a pipe."""
+
+    def __init__(self, text: str = "", tty: bool = False):
+        super().__init__(text)
+        self._tty = tty
+        self.was_read = False
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def read(self, *args):
+        self.was_read = True
+        return super().read(*args)
+
+
+class MainTests(TempDirTestCase):
+    """End-to-end tests of the command line, with $NOTES_DIR set to a temp dir."""
+
+    NOW = datetime(2026, 10, 14, 15, 2)
+    STAMP = "[2026-10-14 15:02]\n"
+
+    def run_note(self, *args: str, stdin: str = "", tty: bool = False):
+        fake_in = FakeStdin(stdin, tty=tty)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {NOTES_DIR_ENV: str(self.dir)}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(list(args), stdin=fake_in, now=lambda: self.NOW)
+        self.last_stdin = fake_in
+        return code, out.getvalue(), err.getvalue()
+
+    def file(self, name: str = "notes.txt") -> str:
+        return (self.dir / name).read_text()
+
+    # -- the `while read` loop bug ----------------------------------------
+
+    def test_single_arg_never_reads_stdin(self):
+        # while read line; do note "$line"; done < file
+        code, _, _ = self.run_note("hello world", stdin="rest of the file\n")
+        self.assertEqual(code, 0)
+        self.assertFalse(self.last_stdin.was_read)
+        self.assertEqual(self.file(), self.STAMP + "hello world\n")
+
+    def test_pipe_with_no_args(self):
+        self.run_note(stdin="piped text\n")
+        self.assertEqual(self.file(), self.STAMP + "piped text\n")
+
+    def test_pipe_into_category_with_dash(self):
+        self.run_note("quotes", "-", stdin="a quote\n")
+        self.assertEqual(self.file("notes-quotes.txt"), self.STAMP + "a quote\n")
+
+    def test_dash_with_empty_stdin_is_error(self):
+        code, _, err = self.run_note("quotes", "-", stdin="")
+        self.assertEqual(code, 1)
+        self.assertIn("nothing saved", err)
+
+    def test_no_args_at_terminal_shows_help(self):
+        code, out, _ = self.run_note(tty=True)
+        self.assertEqual(code, 0)
+        self.assertIn("Usage:", out)
+        self.assertEqual(list_note_files(self.dir), [])
+
+    # -- "--" and unknown options ------------------------------------------
+
+    def test_double_dash_allows_leading_dash(self):
+        code, _, _ = self.run_note("--", "-5 degrees today")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.file(), self.STAMP + "-5 degrees today\n")
+
+    def test_double_dash_with_category(self):
+        self.run_note("weather", "--", "-e is not a flag here")
+        self.assertEqual(self.file("notes-weather.txt"),
+                         self.STAMP + "-e is not a flag here\n")
+
+    def test_double_dash_makes_dash_literal(self):
+        self.run_note("--", "-")
+        self.assertEqual(self.file(), self.STAMP + "-\n")
+
+    def test_unknown_option_is_usage_error(self):
+        code, _, err = self.run_note("-5 degrees")
+        self.assertEqual(code, 2)
+        self.assertIn("note --", err)
+        self.assertEqual(list_note_files(self.dir), [])
+
+    # -- category safety check -------------------------------------------
+
+    def test_category_word_refused_at_terminal(self):
+        append_note("existing", category="test", notes_dir=self.dir)
+        code, _, err = self.run_note("test", tty=True)
+        self.assertEqual(code, 2)
+        self.assertIn("note -m test", err)
+        self.assertFalse((self.dir / "notes.txt").exists())
+
+    def test_category_word_saved_with_double_dash(self):
+        append_note("existing", category="test", notes_dir=self.dir)
+        code, _, _ = self.run_note("--", "test", tty=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.file(), self.STAMP + "test\n")
+
+    def test_category_word_allowed_in_scripts(self):
+        append_note("existing", category="test", notes_dir=self.dir)
+        code, _, _ = self.run_note("test", tty=False)
+        self.assertEqual(code, 0)
+
+    def test_new_single_word_saved_normally(self):
+        code, _, _ = self.run_note("groceries", tty=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.file(), self.STAMP + "groceries\n")
+
+    # -- modes ---------------------------------------------------------------
+
+    def test_multiline_mode_end_to_end(self):
+        code, out, _ = self.run_note("-m", "test",
+                                     stdin='cost: "$5" `now`\n"""\nextra\n')
+        self.assertEqual(code, 0)
+        self.assertIn("notes-test.txt", out)
+        self.assertEqual(self.file("notes-test.txt"),
+                         self.STAMP + 'cost: "$5" `now`\n')
+
+    def test_multiline_bad_category_fails_before_reading(self):
+        code, _, _ = self.run_note("-m", "///", stdin="text\n")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.last_stdin.tell(), 0)
+
+    def test_multiline_too_many_args(self):
+        code, _, _ = self.run_note("-m", "a", "b")
+        self.assertEqual(code, 2)
+
+    def test_show(self):
+        self.run_note("ideas", "first idea")
+        code, out, _ = self.run_note("--show", "ideas")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, self.STAMP + "first idea\n")
+
+    def test_show_missing(self):
+        code, _, _ = self.run_note("--show", "nope")
+        self.assertEqual(code, 1)
+
+    def test_grep_found_and_not_found(self):
+        self.run_note("Buy milk")
+        code, out, _ = self.run_note("--grep", "MILK")
+        self.assertEqual(code, 0)
+        self.assertIn("Buy milk", out)
+        code, out, _ = self.run_note("--grep", "zebra")
+        self.assertEqual(code, 1)
+        self.assertIn("No matching notes", out)
+
+    def test_grep_regex_flag(self):
+        self.run_note("error 404")
+        self.run_note("all good")
+        code, out, _ = self.run_note("--grep", "-E", r"\b\d{3}\b")
+        self.assertEqual(code, 0)
+        self.assertIn("error 404", out)
+        self.assertNotIn("all good", out)
+
+    def test_grep_with_category(self):
+        self.run_note("ideas", "rust tool")
+        self.run_note("rust meetup")
+        _, out, _ = self.run_note("--grep", "rust", "ideas")
+        self.assertIn("notes-ideas.txt", out)
+        self.assertNotIn("meetup", out)
+
+    def test_grep_usage(self):
+        self.assertEqual(self.run_note("--grep")[0], 2)
+        self.assertEqual(self.run_note("--grep", "-E")[0], 2)
+
+    def test_list(self):
+        self.run_note("x")
+        self.run_note("ideas", "y")
+        _, out, _ = self.run_note("--list")
+        self.assertEqual(out.split(), ["notes-ideas.txt", "notes.txt"])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\nCancelled — nothing saved.", file=sys.stderr)
+        sys.exit(130)

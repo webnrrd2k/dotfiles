@@ -1,0 +1,97 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# ///
+#!/usr/bin/env python3
+
+import sys
+import argparse
+import re
+import unicodedata
+import os
+from pathlib import Path
+
+def clean_for_directory(text):
+    # 1. Normalize unicode (e.g., convert 'é' to 'e')
+    #unicodedata.normalize simply drops some characters that I want translated, such as the Polish Ł, so make a translation table to deal witht hem individually
+    text = text.replace("Ł", "L")
+    text = text.replace("ł", "l")
+
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+
+    # 2. Lowercase the strin
+    text = text.lower()
+
+    # 3. Replace anything that isn't a letter, number, or space with nothing
+    text = re.sub(r'[^a-z0-9\s+_-]', '', text)
+
+    text = text.replace("&&", "&")
+    text = text.replace("&&", "&")
+    text = text.replace("&&", "&")
+    text = text.replace("&", "+")
+
+
+    # 4. Replace spaces with a single underscore
+    text = re.sub(r'[\s]+', '_', text)
+
+    # Remove any leading underscores
+    text = text.lstrip('_')
+
+    # Remove any trailing underscores
+    text = text.rstrip('_')
+
+    text = text.replace("_+_", "+")
+
+    text = text.replace("__", "_")
+
+    return text
+
+def main():
+# Set up command line argument parsing
+    parser = argparse.ArgumentParser(description="--in String to clean and make dir name from.")
+    parser.add_argument("--in",                             help="String to clean and make dir name from")
+    parser.add_argument("--incr",                           help="String to clean and make dir name from")
+    parser.add_argument("--filter", action='store_true',    help="Don't make new directory, just pass through pipeline")
+    parser.add_argument("-f",       action='store_true',    help="Don't make new directory, just pass through pipeline")
+    parser.add_argument("-txt",     action='store_true',    help="Pass through pipeline and make a .txt file")
+    parser.add_argument("-md",      action='store_true',    help="Pass through pipeline and make a .md file")
+
+    args = parser.parse_args()
+
+    # Inform the user how to exit if they are typing manually
+    if sys.stdin.isatty():
+        print("Enter text (Press Ctrl+D or Ctrl+Z to finish):", file=sys.stderr)
+
+    cwd = os.getcwd()
+
+    # Process input line by line
+    for line in sys.stdin:
+        # Strip the trailing newlines
+        line = line.rstrip('\n\r')
+        line = line.strip()
+        line = line.strip("\t")
+        clean_line = clean_for_directory(line)
+
+        # Construct and print the new line
+        if len(clean_line) > 0:
+                # Create a directory named 'output_data'
+                if args.filter or args.f:
+                    print(clean_line)
+                elif args.txt:
+                    file_path = Path(cwd + "/" + clean_line + '.txt')
+                    file_path.touch() # Creates an empty file if it doesn't exist
+                elif args.md:
+                    file_path = Path(cwd + "/" + clean_line + '.md')
+                    file_path.touch() # Creates an empty file if it doesn't exist
+
+                    # write content
+                    #file_with_content = Path('file_with_content.txt')
+                    #file_with_content.write_text("Hello from pathlib!")
+                else:
+                    #print(f"New directory name: {clean_line}")
+                    #print(f"Making new directory in: {cwd}")
+                    Path(cwd + "/" + clean_line).mkdir(parents=True, exist_ok=True)
+
+
+if __name__ == "__main__":
+    main()
