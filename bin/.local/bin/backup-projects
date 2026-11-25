@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Mirror ~/Documents/projects/webnrrd2k to a USB drive, skipping things that
+# can be regenerated (virtualenvs, build output, caches, editor junk).
+#
+#   backup-projects /run/media/$USER/MYUSB          # do it
+#   backup-projects /run/media/$USER/MYUSB --dry-run # show what would change
+#
+# Copies to  <drive>/webnrrd2k-backup/current/. Files you deleted or changed
+# locally are not lost from the drive: the old copy is moved to
+# <drive>/webnrrd2k-backup/replaced/<date>/ instead.
+#
+# Deliberately NOT honoring .gitignore: it hides secrets (.env, *.local.bash)
+# and user data (riffape backups/, audio) that belong in a backup.
+set -euo pipefail
+
+src=${SRC:-$HOME/Documents/projects/webnrrd2k}
+drive=${1:?usage: backup-projects /path/to/usb [--dry-run]}
+shift
+[ -d "$drive" ] || { echo "not a directory: $drive" >&2; exit 1; }
+dest="$drive/webnrrd2k-backup"
+stamp=$(date +%Y-%m-%d_%H%M%S)
+mkdir -p "$dest/current"
+
+rsync -a --delete --human-readable --info=stats1,progress2 \
+    --backup --backup-dir="$dest/replaced/$stamp" \
+    --exclude='.venv/' --exclude='venv/' \
+    --exclude='node_modules/' \
+    --exclude='target/' \
+    --exclude='__pycache__/' --exclude='*.pyc' \
+    --exclude='.pytest_cache/' --exclude='.mypy_cache/' --exclude='.ruff_cache/' \
+    --exclude='.cache/' \
+    --exclude='*.kate-swp' --exclude='*~' --exclude='.DS_Store' \
+    "$@" "$src/" "$dest/current/"
+
+sync
+echo "Backed up $src -> $dest/current"
