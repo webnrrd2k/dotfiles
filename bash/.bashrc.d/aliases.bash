@@ -118,7 +118,9 @@ alias rmdirs='rm -r */'												## Remove all directory (recursive), leaving 
 
 alias rmm="rm *.webm; rm *.mkv; rm *.mp4;"
 alias rs="rsync -avhP --ignore-existing "
+alias rsp-dl="cd /run/user/1000/gvfs/mtp:host=SAMSUNG_SAMSUNG_Android_*/'Internal storage/Download/' && find . -type f -mtime -30 -print0 | rsync -rtvP --ignore-existing --files-from=- --from0 ./ /home/jeff/Documents/books_reorganized/unsorted/"
 alias rss="rsync -hvrPt "
+
 alias set_anthropic_api_key='ANTHROPIC_API_KEY=$(cat ~/.config/booksort/api_key)'
 alias s2sc="sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -s ' ' '_' | tr -s '&' '+' | tr '[:upper:]' '[:lower:]'"
 alias u2l='tr [:upper:] [:lower:]'
@@ -143,7 +145,7 @@ alias yt-dl='yt-dlp --download-archive download-archive.txt -o "%(title)s.%(ext)
 alias yt-dlpa='yt-dlp -x --audio-format mp3 --audio-quality 0 --embed-thumbnail --download-archive download-archive.txt --add-metadata --parse-metadata "playlist_index:%(track_number)s" -o "%(artist)s - %(title)s.%(ext)s"'
 #alias yt-dlpa='yt-dlp -x --audio-format mp3 --audio-quality 0 --embed-thumbnail --download-archive download-archive.txt --add-metadata --parse-metadata "playlist_index:%(playlist_index)s" -o "%(artist)s - %(title)s.%(ext)s"'
 alias yt-dlpl="yt-dlp --force-write-archive -s --download-archive download-archive.txt"
-alias yt-dlmix='yt-dlp -I 1:50  --download-archive download-archive.txt --yes-playlist -x --audio-format mp3 -o "%(playlist_title)s/%(playlist_index)03d - %(artist)s - %(title)s.%(ext)s" "$1"'
+alias yt-dlmix='yt-dlp -I 1:150  --download-archive download-archive.txt --yes-playlist -x --audio-format mp3 -o "%(playlist_title)s/%(playlist_index)03d - %(artist)s - %(title)s.%(ext)s" "$1"'
 alias yt-ppl='yt-dlp --flat-playlist --print title $1'
 
 # =================================================
