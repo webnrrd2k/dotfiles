@@ -43,7 +43,7 @@ If you move it, run `install.sh` again from the new location.
 At the end, `install.sh` asks whether to download and build `cn`, the Rust
 version of `dirname-clean`, from
 [clean_dir_name](https://github.com/webnrrd2k/clean_dir_name). It needs cargo
-(`sudo dnf install cargo`) and installs to `~/.cargo/bin`. Pass `--with-cn` or
+(`sudo dnf install cargo`) and installs to `~/.local/bin`. Pass `--with-cn` or
 `--no-cn` to skip the question.
 
 ### Updating

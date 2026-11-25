@@ -41,9 +41,12 @@ if [ "$want_cn" = yes ]; then
         echo "cargo not found; install it with 'sudo dnf install cargo' and rerun with --with-cn" >&2
         exit 1
     fi
-    # Installs to ~/.cargo/bin, which .bashrc puts on PATH.
-    cargo install --git https://github.com/webnrrd2k/clean_dir_name
-    # A hand-copied cn in ~/.local/bin would shadow the new one.
-    old="$HOME/.local/bin/cn"
-    if [ -e "$old" ] && ! [ -L "$old" ]; then mv "$old" "$old.bak"; echo "backed up $old -> $old.bak"; fi
+    # --root ~/.local puts cn in ~/.local/bin (cargo also keeps its
+    # .crates.toml / .crates2.json bookkeeping in ~/.local).
+    if ! cargo install --list --root "$HOME/.local" | grep -q '^clean_dir_name '; then
+        # cargo won't overwrite a cn it didn't install, so set any such file aside.
+        old="$HOME/.local/bin/cn"
+        if [ -e "$old" ] || [ -L "$old" ]; then mv "$old" "$old.bak"; echo "backed up $old -> $old.bak"; fi
+    fi
+    cargo install --root "$HOME/.local" --git https://github.com/webnrrd2k/clean_dir_name
 fi
